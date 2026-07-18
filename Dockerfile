@@ -3,7 +3,9 @@
 ARG FEDORA_VERSION=43
 
 FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION} AS build
-RUN dnf -y install cargo rust protobuf-compiler && dnf clean all
+# protobuf-devel supplies the well-known google/protobuf/*.proto imports under
+# /usr/include that csi.proto pulls in; protobuf-compiler alone lacks them.
+RUN dnf -y install cargo rust protobuf-compiler protobuf-devel && dnf clean all
 WORKDIR /src
 # Cache dependencies first.
 COPY Cargo.toml Cargo.lock ./

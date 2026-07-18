@@ -1,0 +1,63 @@
+# Controller plugin — CreateVolume/DeleteVolume/*Snapshot. Runs the driver in
+# `controller` role alongside the CSI sidecars. Single replica is sufficient;
+# scale with leader election if desired.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rspacefs-csi-controller
+  namespace: rspacefs-csi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rspacefs-csi-controller
+  template:
+    metadata:
+      labels:
+        app: rspacefs-csi-controller
+    spec:
+      serviceAccountName: rspacefs-csi-controller
+      containers:
+        - name: driver
+          image: qregistry.local/rspacefs-csi:0.1.0
+          args:
+            - --endpoint=$(CSI_ENDPOINT)
+            - --role=controller
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          args:
+            - --csi-address=$(ADDRESS)
+            - --leader-election=false
+            - --feature-gates=Topology=false
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        - name: csi-snapshotter
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.1.0
+          args:
+            - --csi-address=$(ADDRESS)
+            - --leader-election=false
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

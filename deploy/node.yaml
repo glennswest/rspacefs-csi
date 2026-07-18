@@ -1,0 +1,85 @@
+# Node plugin — one per node. NodePublishVolume execs `rspacefs-mount --pvc` to
+# FUSE-mount the composed layer view at the kubelet target path.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rspacefs-csi-node
+  namespace: rspacefs-csi
+spec:
+  selector:
+    matchLabels:
+      app: rspacefs-csi-node
+  template:
+    metadata:
+      labels:
+        app: rspacefs-csi-node
+    spec:
+      serviceAccountName: rspacefs-csi-node
+      hostNetwork: false
+      containers:
+        - name: driver
+          image: qregistry.local/rspacefs-csi:0.1.0
+          args:
+            - --endpoint=$(CSI_ENDPOINT)
+            - --role=node
+            - --node-id=$(NODE_ID)
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            # FUSE mount + bind-propagation into kubelet's pods dir require
+            # privileged on most distros.
+            privileged: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: data-dir
+              mountPath: /var/lib/rspacefs-csi
+              mountPropagation: Bidirectional
+            - name: dev-fuse
+              mountPath: /dev/fuse
+
+        - name: csi-node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          args:
+            - --csi-address=$(ADDRESS)
+            - --kubelet-registration-path=$(REGISTRATION_PATH)
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: REGISTRATION_PATH
+              value: /var/lib/kubelet/plugins/rspacefs.csi.g8.io/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/rspacefs.csi.g8.io
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: data-dir
+          hostPath:
+            path: /var/lib/rspacefs-csi
+            type: DirectoryOrCreate
+        - name: dev-fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice

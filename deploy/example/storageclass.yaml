@@ -1,0 +1,17 @@
+# Example StorageClass. Parameters map 1:1 onto `rspacefs-mount --pvc` flags.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rspacefs-db
+provisioner: rspacefs.csi.g8.io
+parameters:
+  # OCI artifact ref(s) pulled as read-only lower layers (comma-separated for
+  # multiple lowers; omit for an empty PVC).
+  seed: qregistry.local/pvcs/db:rev1
+  accessMode: rwo                 # empty | ro | rwo | rwx
+  lifecycle: ephemeral-then-persistent  # persistent | ephemeral | ephemeral-then-persistent
+  owner: "1000:1000"              # workload runAsUser UID:GID
+  captureOnDelete: "true"         # push final upper as a new registry revision
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: false

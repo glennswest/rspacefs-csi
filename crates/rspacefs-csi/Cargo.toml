@@ -1,0 +1,22 @@
+[package]
+name = "rspacefs-csi"
+description = "Kubernetes/OpenShift CSI driver for rspacefs layered-filesystem data PVCs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rspacefs-csi"
+path = "src/main.rs"
+
+[dependencies]
+csi-proto = { path = "../csi-proto" }
+tonic.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

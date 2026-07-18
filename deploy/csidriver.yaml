@@ -1,0 +1,14 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: rspacefs.csi.g8.io
+spec:
+  # rspacefs is single-consumer; the CO does not attach — mounts happen on the
+  # node during NodePublishVolume.
+  attachRequired: false
+  podInfoOnMount: true
+  # A pod references the PVC as a filesystem; ephemeral inline volumes are not
+  # the primary model.
+  volumeLifecycleModes:
+    - Persistent
+  fsGroupPolicy: File

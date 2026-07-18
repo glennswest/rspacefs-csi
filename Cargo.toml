@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/csi-proto", "crates/rspacefs-csi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Glenn West"]
+repository = "https://github.com/glennswest/rspacefs-csi"
+
+[workspace.dependencies]
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "process",
+    "fs",
+    "io-util",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+strip = true
+lto = "thin"

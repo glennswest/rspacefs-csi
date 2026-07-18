@@ -1,0 +1,16 @@
+# A VolumeSnapshot of an rspacefs PVC is a capture-layer → registry revision.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: rspacefs-snapshots
+driver: rspacefs.csi.g8.io
+deletionPolicy: Delete
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: db-data-snap1
+spec:
+  volumeSnapshotClassName: rspacefs-snapshots
+  source:
+    persistentVolumeClaimName: db-data

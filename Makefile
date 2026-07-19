@@ -2,7 +2,7 @@
 # The build host uses podman (no docker); override CONTAINER_ENGINE if needed.
 
 CONTAINER_ENGINE ?= podman
-REGISTRY         ?= qregistry.local
+REGISTRY         ?= ghcr.io/glennswest
 IMAGE_NAME       ?= rspacefs-csi
 VERSION          ?= $(shell awk -F\" '/^version/ {print $$2; exit}' Cargo.toml)
 IMAGE            ?= $(REGISTRY)/$(IMAGE_NAME):$(VERSION)

@@ -18,7 +18,7 @@ spec:
       hostNetwork: false
       containers:
         - name: driver
-          image: qregistry.local/rspacefs-csi:0.1.0
+          image: ghcr.io/glennswest/rspacefs-csi:0.2.0
           args:
             - --endpoint=$(CSI_ENDPOINT)
             - --role=node

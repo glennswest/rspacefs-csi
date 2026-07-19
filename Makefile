@@ -45,7 +45,7 @@ push:
 dist: release
 	@mkdir -p dist
 	@cp $(BIN) dist/rspacefs-csi-$(VERSION)-$(if $(TARGET),$(TARGET),$(shell rustc -vV | awk '/host:/ {print $$2}'))
-	@cd dist && for f in rspacefs-csi-*; do sha256sum "$$f" > "$$f.sha256"; done
+	@cd dist && for f in rspacefs-csi-*; do case "$$f" in *.sha256) continue;; esac; sha256sum "$$f" > "$$f.sha256"; done
 	@ls -l dist
 
 clean:

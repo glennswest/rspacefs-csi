@@ -17,7 +17,8 @@ pub enum Role {
     Controller,
     /// Node plugin (DaemonSet): NodePublishVolume → `rspacefs-mount --pvc`.
     Node,
-    /// Both services in one process (useful for local testing).
+    /// Both services in one process (single-node / dev; lets the controller
+    /// capture snapshots against the node-local control socket).
     All,
 }
 
@@ -38,8 +39,10 @@ pub struct Config {
     /// Root under which per-volume upper dirs, pulled lower blobs, and control
     /// sockets live on the node (e.g. `/var/lib/rspacefs-csi`).
     pub data_dir: PathBuf,
-    /// Path to the `rspacefs-mount` binary the node plugin execs.
-    pub mount_bin: PathBuf,
+    /// Default `registry[/prefix]` for captured revisions when a volume/snapshot
+    /// specifies no `captureRepo` and has no seed to derive one from
+    /// (e.g. `qregistry.local`). Captures land at `<registry>/pvcs/<id>`.
+    pub capture_registry: Option<String>,
 }
 
 impl Config {
@@ -51,8 +54,16 @@ impl Config {
     pub fn upper_dir(&self, volume_id: &str) -> PathBuf {
         self.volume_dir(volume_id).join("upper")
     }
+    /// Directory holding this volume's pulled read-only lower blobs.
+    pub fn lowers_dir(&self, volume_id: &str) -> PathBuf {
+        self.volume_dir(volume_id).join("lowers")
+    }
     /// The FUSE daemon control socket passed to `rspacefs-mount --control-socket`.
     pub fn control_socket(&self, volume_id: &str) -> PathBuf {
         self.volume_dir(volume_id).join("control.sock")
+    }
+    /// Staging path a `capture-layer` writes its tar+zstd blob to before push.
+    pub fn capture_staging(&self, volume_id: &str) -> PathBuf {
+        self.volume_dir(volume_id).join("capture.tar.zst")
     }
 }

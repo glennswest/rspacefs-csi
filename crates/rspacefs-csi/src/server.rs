@@ -12,10 +12,20 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tracing::info;
 
+use crate::control::Capturer;
 use crate::controller::ControllerService;
 use crate::driver::{Config, Role};
 use crate::identity::IdentityService;
+use crate::mount::Mounter;
 use crate::node::NodeService;
+use crate::registry::Registry;
+
+/// The backends the services are wired to. Real impls in `main`; mocks in tests.
+pub struct Backends {
+    pub mounter: Arc<dyn Mounter>,
+    pub registry: Arc<dyn Registry>,
+    pub capturer: Arc<dyn Capturer>,
+}
 
 /// Parse a CSI endpoint (`unix:///csi/csi.sock`, `unix://relative.sock`, or a
 /// bare path) into a filesystem path.
@@ -28,6 +38,7 @@ pub async fn serve(
     endpoint: &str,
     role: Role,
     cfg: Arc<Config>,
+    backends: Backends,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = endpoint_path(endpoint);
     if let Some(parent) = path.parent() {
@@ -41,12 +52,21 @@ pub async fn serve(
     let listener = UnixListener::bind(&path)?;
     let incoming = UnixListenerStream::new(listener);
 
-    let controller = role
-        .serves_controller()
-        .then(|| ControllerServer::new(ControllerService));
-    let node = role
-        .serves_node()
-        .then(|| NodeServer::new(NodeService::new(cfg.clone())));
+    let controller = role.serves_controller().then(|| {
+        ControllerServer::new(ControllerService::new(
+            cfg.clone(),
+            backends.registry.clone(),
+            backends.capturer.clone(),
+        ))
+    });
+    let node = role.serves_node().then(|| {
+        NodeServer::new(NodeService::new(
+            cfg.clone(),
+            backends.mounter.clone(),
+            backends.registry.clone(),
+            backends.capturer.clone(),
+        ))
+    });
 
     let router = Server::builder()
         .add_service(IdentityServer::new(IdentityService))

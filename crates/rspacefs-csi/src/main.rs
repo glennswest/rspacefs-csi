@@ -1,17 +1,27 @@
-//! rspacefs-csi — CSI driver for rspacefs layered-filesystem data PVCs.
+//! rspacefs-csi — CSI driver for rspacefs layered-filesystem **data** PVCs.
 //!
 //! One binary, run as either the controller plugin (Deployment) or the node
-//! plugin (DaemonSet); the identity service runs in both. See the README for the
-//! CSI-RPC → rspacefs mapping.
+//! plugin (DaemonSet); the identity service runs in both. It is data-volume
+//! only — container rootfs images are handled by CRI-O + rspacefs, not here.
+//! See the README for the CSI-RPC → rspacefs mapping.
 
+// tonic's `Status` is a large error type; every CSI RPC returns it, so allowing
+// this lint crate-wide keeps our own helpers consistent with the trait surface.
+#![allow(clippy::result_large_err)]
+
+mod control;
 mod controller;
 mod driver;
+mod freeze;
 mod identity;
 mod mount;
 mod node;
-mod oci;
 mod params;
+mod registry;
 mod server;
+
+#[cfg(test)]
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +29,11 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use control::SocketControl;
 use driver::{Config, Role};
+use mount::RspacefsMounter;
+use registry::OciClient;
+use server::Backends;
 
 /// CSI driver for rspacefs layered-filesystem data PVCs.
 #[derive(Debug, Parser)]
@@ -48,6 +62,19 @@ struct Args {
     /// Path to the rspacefs-mount binary the node plugin execs.
     #[arg(long, env = "RSPACEFS_MOUNT_BIN", default_value = "rspacefs-mount")]
     mount_bin: PathBuf,
+
+    /// Registry scheme for OCI pulls/pushes (`https` or `http`).
+    #[arg(long, env = "RSPACEFS_REGISTRY_SCHEME", default_value = "https")]
+    registry_scheme: String,
+
+    /// Accept invalid TLS certs (self-signed local registries like qregistry.local).
+    #[arg(long, env = "RSPACEFS_REGISTRY_INSECURE", default_value_t = false)]
+    registry_insecure: bool,
+
+    /// Default `registry[/prefix]` for captured revisions when none is derivable
+    /// from a seed or `captureRepo` (e.g. `qregistry.local`).
+    #[arg(long, env = "RSPACEFS_CAPTURE_REGISTRY")]
+    capture_registry: Option<String>,
 }
 
 #[tokio::main]
@@ -68,8 +95,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(Config {
         node_id: args.node_id,
         data_dir: args.data_dir,
-        mount_bin: args.mount_bin,
+        capture_registry: args.capture_registry,
     });
 
-    server::serve(&args.endpoint, args.role, cfg).await
+    let backends = Backends {
+        mounter: Arc::new(RspacefsMounter {
+            mount_bin: args.mount_bin,
+        }),
+        registry: Arc::new(OciClient::new(
+            args.registry_scheme,
+            args.registry_insecure,
+        )?),
+        capturer: Arc::new(SocketControl),
+    };
+
+    server::serve(&args.endpoint, args.role, cfg, backends).await
 }

@@ -15,9 +15,21 @@ objects. It is **not block storage** — there is no LUN, no attach, no
 replication. Every CSI operation is *mount-shaped*: the node plugin FUSE-mounts
 a composed layer view; there is nothing to format or attach.
 
-> **Status: scaffolding.** The design is settled (below); the gRPC service
-> bodies are stubbed. See [issue tracker](https://github.com/glennswest/rspacefs-csi/issues)
-> for progress.
+> **Status: functional (v0.2).** The gRPC services are implemented end to end:
+> the node plugin pulls seed data-artifact lowers from the registry and execs
+> `rspacefs-mount --pvc`; snapshots/captureOnDelete freeze the upper via the
+> daemon control socket and push it back as a new data revision. Real registry
+> and control-socket wire clients ship in-tree, unit-tested against mocks plus an
+> opt-in live-registry round-trip. Cross-node snapshotting (controller reaching a
+> volume on another node) and streaming/chunked push for very large uppers are
+> the remaining follow-ups. See the [issue tracker](https://github.com/glennswest/rspacefs-csi/issues).
+
+**Data volumes only.** rspacefs-csi never handles container rootfs images (that
+is CRI-O + rspacefs `mount_program`). A data image either arrives like any OCI
+artifact (pulled as a seed) or is *created* by this driver via capture-to-layer.
+The four operations: **create** a volume, **mount** an existing one to a
+container, **freeze** it into a registry revision, and **attach a copy** to
+another container (provision-from-snapshot = copy-on-write clone).
 
 ## Where this sits (platform storage taxonomy)
 
@@ -82,7 +94,20 @@ Map 1:1 onto `rspacefs-mount --pvc` flags:
 | `accessMode` | `--access-mode` | `empty` \| `ro` \| `rwo` \| `rwx` |
 | `lifecycle` | `--lifecycle` | `persistent` \| `ephemeral` \| `ephemeral-then-persistent` |
 | `owner` | `--owner UID:GID` | The workload's runAsUser. |
-| `captureOnDelete` | `capture-layer` at `DeleteVolume` | Push the final upper as a new registry revision. |
+| `captureOnDelete` | `capture-layer` at unpublish/hand-off | Freeze the upper and push it as a new registry revision before unmount. |
+| `captureRepo` | push target for captures | `registry/repo` for `captureOnDelete`/snapshots. Defaults to the first seed's `registry/repo`. |
+
+### Registry configuration (driver flags / env)
+
+| Flag | Env | Purpose |
+|---|---|---|
+| `--registry-scheme` | `RSPACEFS_REGISTRY_SCHEME` | `https` (default) or `http`. |
+| `--registry-insecure` | `RSPACEFS_REGISTRY_INSECURE` | Accept self-signed TLS (local `qregistry.local`). |
+| `--capture-registry` | `RSPACEFS_CAPTURE_REGISTRY` | Default `registry[/prefix]` for snapshots with no `captureRepo`/seed. |
+
+`rspacefs-mount` (and its `capture-layer` control op) is provided by the rspacefs
+image/package the node plugin is layered on; the driver execs it and speaks its
+control socket.
 
 ## Building
 

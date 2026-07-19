@@ -1,114 +1,124 @@
-//! The `rspacefs-mount --pvc` exec wrapper used by the node plugin.
+//! The `rspacefs-mount --pvc` exec wrapper used by the node plugin, behind a
+//! [`Mounter`] trait so node logic unit-tests without a real FUSE mount.
 //!
-//! `publish` composes the layer view (writable upper + registry-seeded lowers)
-//! as a FUSE mount at the kubelet target path; `unpublish` tears it down.
+//! Command shape (per rspacefs `docs/pvc.md`):
+//! ```text
+//! rspacefs-mount --pvc --name <id> --access-mode <m> --lifecycle <l>
+//!   [--lower-blob <pulled-path>]... --upper <dir> [--owner UID:GID]
+//!   --control-socket <sock> <target_path>
+//! ```
+//! There is no `--read-only` flag — read-only is `--access-mode ro`.
 
-use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use tokio::fs;
+use async_trait::async_trait;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::debug;
 
-use crate::driver::Config;
-use crate::oci;
-use crate::params::PvcParams;
+use crate::params::{AccessMode, Lifecycle};
 
-/// FUSE-mount the composed layer view at `target_path`.
-///
-/// Builds:
-/// `rspacefs-mount --pvc [--lower-blob <blob> ...] --upper <dir>
-///   [--owner UID:GID] [--access-mode <m>] [--lifecycle <l>] [--read-only]
-///   --control-socket <sock> <target_path>`
-pub async fn publish(
-    cfg: &Config,
-    volume_id: &str,
-    target_path: &str,
-    params: &PvcParams,
-    readonly: bool,
-) -> io::Result<()> {
-    let upper = cfg.upper_dir(volume_id);
-    let control = cfg.control_socket(volume_id);
-
-    // Per-volume working dirs on the node.
-    fs::create_dir_all(&upper).await?;
-    // The target path is created by the kubelet as a directory for fs volumes;
-    // ensure it exists so the mount has somewhere to land.
-    fs::create_dir_all(target_path).await?;
-
-    let mut cmd = Command::new(&cfg.mount_bin);
-    cmd.arg("--pvc");
-
-    // Resolve each seed to a local read-only lower blob, then pass it through.
-    for seed in &params.seeds {
-        let blob = oci::resolve_lower(seed).await.map_err(io::Error::other)?;
-        cmd.arg("--lower-blob").arg(blob);
-    }
-
-    cmd.arg("--upper").arg(&upper);
-
-    if let Some(owner) = &params.owner {
-        cmd.arg("--owner").arg(owner);
-    }
-    if let Some(mode) = &params.access_mode {
-        cmd.arg("--access-mode").arg(mode);
-    }
-    if let Some(lc) = &params.lifecycle {
-        cmd.arg("--lifecycle").arg(lc);
-    }
-    if readonly {
-        cmd.arg("--read-only");
-    }
-
-    cmd.arg("--control-socket").arg(&control);
-    cmd.arg(target_path);
-
-    debug!(?cmd, "spawning rspacefs-mount");
-
-    // rspacefs-mount daemonizes the FUSE server and returns once the mount is
-    // live, so we wait for its exit status and surface a non-zero code.
-    let output = cmd.output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(format!(
-            "rspacefs-mount exited with {}: {}",
-            output.status,
-            stderr.trim()
-        )));
-    }
-    info!(volume = %volume_id, ?upper, "rspacefs-mount established");
-    Ok(())
+/// Everything needed to bring up one PVC FUSE mount.
+#[derive(Debug, Clone)]
+pub struct MountSpec {
+    /// PVC identifier (`--name`), used in logs and capture filenames.
+    pub name: String,
+    /// Kubelet target path the merged view is mounted at.
+    pub target: PathBuf,
+    /// Writable upper directory (`--upper`).
+    pub upper: PathBuf,
+    /// Daemon control socket (`--control-socket`).
+    pub control_socket: PathBuf,
+    pub access_mode: AccessMode,
+    pub lifecycle: Lifecycle,
+    /// `UID:GID` for `--owner`, if set.
+    pub owner: Option<String>,
+    /// Pulled read-only lower blob paths, top-down (`--lower-blob`, repeatable).
+    pub lower_blobs: Vec<PathBuf>,
 }
 
-/// Unmount the FUSE view and reap the daemon.
-pub async fn unpublish(cfg: &Config, volume_id: &str, target_path: &str) -> io::Result<()> {
-    // If the target is already gone / not mounted, treat unpublish as idempotent.
-    if !Path::new(target_path).exists() {
-        return Ok(());
+impl MountSpec {
+    /// Render the argv for `rspacefs-mount` (excluding argv[0]).
+    pub fn args(&self) -> Vec<String> {
+        let mut a = vec!["--pvc".into(), "--name".into(), self.name.clone()];
+        a.push("--access-mode".into());
+        a.push(self.access_mode.as_flag().into());
+        a.push("--lifecycle".into());
+        a.push(self.lifecycle.as_flag().into());
+        for blob in &self.lower_blobs {
+            a.push("--lower-blob".into());
+            a.push(blob.display().to_string());
+        }
+        a.push("--upper".into());
+        a.push(self.upper.display().to_string());
+        if let Some(owner) = &self.owner {
+            a.push("--owner".into());
+            a.push(owner.clone());
+        }
+        a.push("--control-socket".into());
+        a.push(self.control_socket.display().to_string());
+        a.push(self.target.display().to_string());
+        a
     }
-
-    // Prefer fusermount3 (unprivileged FUSE unmount); fall back to umount.
-    let unmounted = run_ok(Command::new("fusermount3").arg("-u").arg(target_path)).await
-        || run_ok(Command::new("fusermount").arg("-u").arg(target_path)).await
-        || run_ok(Command::new("umount").arg(target_path)).await;
-
-    if !unmounted {
-        return Err(io::Error::other(format!("could not unmount {target_path}")));
-    }
-
-    // TODO(rspacefs): signal the daemon via the control socket for a clean
-    // shutdown / optional capture before removing the working dir.
-    let _ = cfg.control_socket(volume_id);
-
-    // Remove the kubelet mount point directory (best-effort).
-    let _ = fs::remove_dir(target_path).await;
-    Ok(())
 }
 
-/// Run a command, returning true iff it exits 0.
-async fn run_ok(cmd: &mut Command) -> bool {
-    match cmd.output().await {
-        Ok(o) => o.status.success(),
-        Err(_) => false,
+#[derive(Debug, thiserror::Error)]
+pub enum MountError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("rspacefs-mount exited {status}: {stderr}")]
+    MountFailed { status: String, stderr: String },
+    #[error("could not unmount {0}")]
+    UnmountFailed(String),
+}
+
+/// FUSE mount operations. The real impl execs `rspacefs-mount`; tests use a mock.
+#[async_trait]
+pub trait Mounter: Send + Sync {
+    async fn mount(&self, spec: &MountSpec) -> Result<(), MountError>;
+    async fn unmount(&self, target: &Path) -> Result<(), MountError>;
+}
+
+/// Real mounter: shells out to `rspacefs-mount` and `fusermount3`/`umount`.
+pub struct RspacefsMounter {
+    pub mount_bin: PathBuf,
+}
+
+#[async_trait]
+impl Mounter for RspacefsMounter {
+    async fn mount(&self, spec: &MountSpec) -> Result<(), MountError> {
+        let args = spec.args();
+        debug!(bin = %self.mount_bin.display(), ?args, "spawning rspacefs-mount");
+        // rspacefs-mount daemonizes once the kernel acknowledges the mount, so
+        // waiting for exit returns promptly with a status.
+        let output = Command::new(&self.mount_bin).args(&args).output().await?;
+        if !output.status.success() {
+            return Err(MountError::MountFailed {
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(())
     }
+
+    async fn unmount(&self, target: &Path) -> Result<(), MountError> {
+        if !target.exists() {
+            // Idempotent: nothing mounted / already cleaned up.
+            return Ok(());
+        }
+        let t = target.display().to_string();
+        let ok = run_ok("fusermount3", &["-u", &t]).await
+            || run_ok("fusermount", &["-u", &t]).await
+            || run_ok("umount", &[&t]).await;
+        if !ok {
+            return Err(MountError::UnmountFailed(t));
+        }
+        Ok(())
+    }
+}
+
+async fn run_ok(bin: &str, args: &[&str]) -> bool {
+    matches!(
+        Command::new(bin).args(args).output().await,
+        Ok(o) if o.status.success()
+    )
 }

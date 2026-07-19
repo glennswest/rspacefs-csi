@@ -1,9 +1,12 @@
 //! Node service (DaemonSet) — the mount side of the driver.
 //!
-//! Every CSI op here is mount-shaped. There is no block device: Stage/Unstage
-//! are no-ops, and `NodePublishVolume` execs `rspacefs-mount --pvc` to FUSE-mount
-//! the composed layer view at the kubelet target path.
+//! Every op here is mount-shaped. Stage/Unstage are no-ops; `NodePublishVolume`
+//! pulls the seed data-artifact lower(s) and execs `rspacefs-mount --pvc` to
+//! FUSE-mount the composed layer view; `NodeUnpublishVolume` optionally freezes
+//! the upper into a new data revision (captureOnDelete / hand-off) then unmounts.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use csi_proto::node_server::Node;
@@ -19,23 +22,61 @@ use csi_proto::{
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use crate::control::Capturer;
 use crate::driver::Config;
-use crate::mount;
-use crate::params::PvcParams;
+use crate::mount::{MountSpec, Mounter};
+use crate::params::{AccessMode, Lifecycle, PvcParams, VOLUME_NAME};
+use crate::registry::Registry;
 
 pub struct NodeService {
     cfg: Arc<Config>,
+    mounter: Arc<dyn Mounter>,
+    registry: Arc<dyn Registry>,
+    capturer: Arc<dyn Capturer>,
 }
 
 impl NodeService {
-    pub fn new(cfg: Arc<Config>) -> Self {
-        Self { cfg }
+    pub fn new(
+        cfg: Arc<Config>,
+        mounter: Arc<dyn Mounter>,
+        registry: Arc<dyn Registry>,
+        capturer: Arc<dyn Capturer>,
+    ) -> Self {
+        Self {
+            cfg,
+            mounter,
+            registry,
+            capturer,
+        }
     }
 }
 
 fn cap(rpc: CapRpc) -> NodeServiceCapability {
     NodeServiceCapability {
         r#type: Some(CapType::Rpc(Rpc { r#type: rpc as i32 })),
+    }
+}
+
+/// Effective access mode: an explicit CSI read-only publish forces `ro`;
+/// otherwise the param, else `empty` for a seedless PVC / `rwo` when seeded.
+fn effective_access_mode(params: &PvcParams, readonly: bool) -> AccessMode {
+    if readonly {
+        return AccessMode::Ro;
+    }
+    params.access_mode.unwrap_or({
+        if params.seeds.is_empty() {
+            AccessMode::Empty
+        } else {
+            AccessMode::Rwo
+        }
+    })
+}
+
+impl NodeService {
+    /// Persisted publish context path (NodeUnpublish gets no volume_context, so
+    /// we stash it at publish to honor captureOnDelete on the way out).
+    fn state_path(&self, volume_id: &str) -> std::path::PathBuf {
+        self.cfg.volume_dir(volume_id).join("publish.json")
     }
 }
 
@@ -66,7 +107,6 @@ impl Node for NodeService {
         &self,
         _req: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
-        // No block device to format/attach — nothing to stage.
         Ok(Response::new(NodeStageVolumeResponse {}))
     }
 
@@ -89,22 +129,65 @@ impl Node for NodeService {
             return Err(Status::invalid_argument("target_path is required"));
         }
 
-        let params = PvcParams::parse(&req.volume_context);
+        let params = PvcParams::parse(&req.volume_context)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let access_mode = effective_access_mode(&params, req.readonly);
+        let lifecycle = params.lifecycle.unwrap_or(Lifecycle::Persistent);
 
-        mount::publish(
-            &self.cfg,
-            &req.volume_id,
-            &req.target_path,
-            &params,
-            req.readonly,
-        )
-        .await
-        .map_err(|e| {
-            warn!(volume = %req.volume_id, error = %e, "publish failed");
-            Status::internal(format!("rspacefs-mount failed: {e}"))
+        let upper = self.cfg.upper_dir(&req.volume_id);
+        let lowers_dir = self.cfg.lowers_dir(&req.volume_id);
+        let control_socket = self.cfg.control_socket(&req.volume_id);
+
+        // Pull each seed's data-artifact layers into the per-volume lowers dir,
+        // ordered by seed then top-down within a seed.
+        let mut lower_blobs = Vec::new();
+        for seed in &params.seeds {
+            let blobs = self
+                .registry
+                .pull_layers(seed, &lowers_dir)
+                .await
+                .map_err(|e| Status::failed_precondition(format!("seed {seed}: {e}")))?;
+            lower_blobs.extend(blobs);
+        }
+
+        tokio::fs::create_dir_all(&upper)
+            .await
+            .map_err(|e| Status::internal(format!("create upper: {e}")))?;
+        tokio::fs::create_dir_all(&req.target_path)
+            .await
+            .map_err(|e| Status::internal(format!("create target: {e}")))?;
+
+        let name = req
+            .volume_context
+            .get(VOLUME_NAME)
+            .cloned()
+            .unwrap_or_else(|| req.volume_id.clone());
+
+        let spec = MountSpec {
+            name,
+            target: req.target_path.clone().into(),
+            upper,
+            control_socket,
+            access_mode,
+            lifecycle,
+            owner: params.owner.clone(),
+            lower_blobs,
+        };
+
+        self.mounter.mount(&spec).await.map_err(|e| {
+            warn!(volume = %req.volume_id, error = %e, "mount failed");
+            Status::internal(format!("rspacefs-mount: {e}"))
         })?;
 
-        info!(volume = %req.volume_id, target = %req.target_path, "published volume");
+        // Stash the publish context for NodeUnpublish (which gets none).
+        if let Err(e) = self
+            .persist_state(&req.volume_id, &req.volume_context)
+            .await
+        {
+            warn!(volume = %req.volume_id, error = %e, "could not persist publish state");
+        }
+
+        info!(volume = %req.volume_id, target = %req.target_path, mode = access_mode.as_flag(), "published volume");
         Ok(Response::new(NodePublishVolumeResponse {}))
     }
 
@@ -120,12 +203,28 @@ impl Node for NodeService {
             return Err(Status::invalid_argument("target_path is required"));
         }
 
-        mount::unpublish(&self.cfg, &req.volume_id, &req.target_path)
+        // Recover the publish context; capture-on-handoff needs it and the live
+        // daemon, so it must run before we unmount.
+        if let Some(ctx) = self.load_state(&req.volume_id).await {
+            if let Ok(params) = PvcParams::parse(&ctx) {
+                if params.capture_on_delete {
+                    self.freeze_on_unpublish(&req.volume_id, &ctx, &params)
+                        .await?;
+                }
+            }
+        }
+
+        self.mounter
+            .unmount(Path::new(&req.target_path))
             .await
             .map_err(|e| {
-                warn!(volume = %req.volume_id, error = %e, "unpublish failed");
-                Status::internal(format!("unmount failed: {e}"))
+                warn!(volume = %req.volume_id, error = %e, "unmount failed");
+                Status::internal(format!("unmount: {e}"))
             })?;
+
+        // Best-effort cleanup of the kubelet mount point and publish state.
+        let _ = tokio::fs::remove_dir(&req.target_path).await;
+        let _ = tokio::fs::remove_file(self.state_path(&req.volume_id)).await;
 
         info!(volume = %req.volume_id, target = %req.target_path, "unpublished volume");
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
@@ -144,4 +243,76 @@ impl Node for NodeService {
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
         Err(Status::unimplemented("EXPAND_VOLUME is not advertised"))
     }
+}
+
+impl NodeService {
+    async fn persist_state(
+        &self,
+        volume_id: &str,
+        ctx: &HashMap<String, String>,
+    ) -> std::io::Result<()> {
+        let path = self.state_path(volume_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let bytes = serde_json::to_vec(ctx)?;
+        tokio::fs::write(path, bytes).await
+    }
+
+    async fn load_state(&self, volume_id: &str) -> Option<HashMap<String, String>> {
+        let bytes = tokio::fs::read(self.state_path(volume_id)).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Freeze the live upper into a new data revision before unmount.
+    async fn freeze_on_unpublish(
+        &self,
+        volume_id: &str,
+        ctx: &HashMap<String, String>,
+        params: &PvcParams,
+    ) -> Result<(), Status> {
+        let control_socket = self.cfg.control_socket(volume_id);
+        let repo = params.resolved_capture_repo().ok_or_else(|| {
+            Status::failed_precondition(
+                "captureOnDelete set but no captureRepo and no seed to derive one from",
+            )
+        })?;
+        let name = ctx
+            .get(VOLUME_NAME)
+            .cloned()
+            .unwrap_or_else(|| volume_id.to_string());
+        let target_ref = format!("{repo}:{}", sanitize_tag(&name));
+        let staging = self.cfg.capture_staging(volume_id);
+
+        let pushed = crate::freeze::freeze_and_push(
+            self.capturer.as_ref(),
+            self.registry.as_ref(),
+            &control_socket,
+            &staging,
+            &target_ref,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("capture-on-delete: {e}")))?;
+        info!(volume = %volume_id, reference = %pushed, "captured volume on unpublish");
+        Ok(())
+    }
+}
+
+/// Reduce an arbitrary PVC name to a valid OCI tag (`[A-Za-z0-9_.-]{1,128}`).
+pub fn sanitize_tag(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(128);
+    if out.is_empty() {
+        out.push_str("rev");
+    }
+    out
 }

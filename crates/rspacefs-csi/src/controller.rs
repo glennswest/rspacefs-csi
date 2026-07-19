@@ -1,10 +1,17 @@
-//! Controller service (Deployment) — the OCI-artifact side of the driver.
+//! Controller service (Deployment) — the data-artifact side of the driver.
 //!
-//! `CreateVolume` resolves the seed artifact(s) and mints a logical volume;
-//! `DeleteVolume` optionally captures the upper back to the registry;
-//! `CreateSnapshot` captures the upper as a pushable/pullable registry revision.
-//! The node-local upper directory and FUSE mount are handled by the node plugin.
+//! `CreateVolume` mints a logical PVC and validates its seed data-artifact(s);
+//! `CreateSnapshot` freezes a live volume's upper into a new registry revision;
+//! `DeleteVolume`/`DeleteSnapshot` release. The node-local upper directory and
+//! FUSE mount are the node plugin's job.
+//!
+//! Snapshotting needs the volume's live control socket, which lives on the node
+//! hosting the volume. When the controller shares that host (role `all`, or a
+//! hostPath data-dir), it freezes directly; otherwise it returns
+//! FailedPrecondition telling the caller to snapshot from the node.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use csi_proto::controller_server::Controller;
@@ -24,11 +31,27 @@ use csi_proto::{
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::oci;
-use crate::params::{PvcParams, VOLUME_NAME};
+use crate::control::Capturer;
+use crate::driver::Config;
+use crate::node::sanitize_tag;
+use crate::params::{PvcParams, CAPTURE_REPO, VOLUME_NAME};
+use crate::registry::Registry;
 
-#[derive(Debug, Default)]
-pub struct ControllerService;
+pub struct ControllerService {
+    cfg: Arc<Config>,
+    registry: Arc<dyn Registry>,
+    capturer: Arc<dyn Capturer>,
+}
+
+impl ControllerService {
+    pub fn new(cfg: Arc<Config>, registry: Arc<dyn Registry>, capturer: Arc<dyn Capturer>) -> Self {
+        Self {
+            cfg,
+            registry,
+            capturer,
+        }
+    }
+}
 
 fn cap(rpc: CapRpc) -> ControllerServiceCapability {
     ControllerServiceCapability {
@@ -43,6 +66,9 @@ impl Controller for ControllerService {
         _req: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
         Ok(Response::new(ControllerGetCapabilitiesResponse {
+            // CREATE_DELETE_SNAPSHOT covers "freeze"; "attach a copy to another
+            // container" is then provision-from-snapshot, which needs no extra
+            // capability (the external-provisioner passes it as a content source).
             capabilities: vec![
                 cap(CapRpc::CreateDeleteVolume),
                 cap(CapRpc::CreateDeleteSnapshot),
@@ -62,10 +88,11 @@ impl Controller for ControllerService {
             return Err(Status::invalid_argument("volume_capabilities is required"));
         }
 
-        let params = PvcParams::parse(&req.parameters);
+        let mut params = PvcParams::parse(&req.parameters)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        // If provisioning from a snapshot, that revision becomes an extra lower.
-        let mut params = params;
+        // Provision-from-snapshot / clone: the source revision becomes a lower,
+        // so the new volume is a copy-on-write copy for another container.
         if let Some(src) = &req.volume_content_source {
             if let Some(csi_proto::volume_content_source::Type::Snapshot(s)) = &src.r#type {
                 info!(snapshot = %s.snapshot_id, "seeding volume from snapshot");
@@ -73,18 +100,15 @@ impl Controller for ControllerService {
             }
         }
 
-        // Resolve (pull metadata / verify existence of) each seed artifact.
-        // TODO(rspacefs): actually pull blobs into the shared content store.
+        // Validate each seed data-artifact exists (fail fast on a bad ref).
         for seed in &params.seeds {
-            oci::resolve_lower(seed)
+            self.registry
+                .resolve(seed)
                 .await
                 .map_err(|e| Status::failed_precondition(format!("seed {seed}: {e}")))?;
         }
 
-        // The volume id is the CO-provided name; rspacefs volumes are named,
-        // not block-extent handles.
         let volume_id = req.name.clone();
-
         let mut ctx = params.to_volume_context();
         ctx.insert(VOLUME_NAME.to_string(), req.name.clone());
 
@@ -95,7 +119,6 @@ impl Controller for ControllerService {
             .unwrap_or(0);
 
         info!(volume = %volume_id, seeds = params.seeds.len(), "created volume");
-
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
                 capacity_bytes,
@@ -115,10 +138,8 @@ impl Controller for ControllerService {
         if req.volume_id.is_empty() {
             return Err(Status::invalid_argument("volume_id is required"));
         }
-        // captureOnDelete is carried in the (secret-free) volume context that the
-        // CO replays on delete; here we only have volume_id + secrets, so the
-        // policy is enforced by the node/registry side.
-        // TODO(rspacefs): capture-layer the upper if captureOnDelete, then release.
+        // The upper is node-local and any captureOnDelete freeze already happened
+        // at NodeUnpublish; the logical volume carries no controller-side state.
         info!(volume = %req.volume_id, "deleted volume");
         Ok(Response::new(DeleteVolumeResponse {}))
     }
@@ -135,11 +156,27 @@ impl Controller for ControllerService {
             return Err(Status::invalid_argument("name is required"));
         }
 
-        // TODO(rspacefs): capture-layer → deterministic tar+zstd OCI artifact,
-        // deduped by digest. The snapshot id IS the registry revision ref.
-        let snapshot_id = oci::snapshot_ref(&req.source_volume_id, &req.name);
-        info!(snapshot = %snapshot_id, source = %req.source_volume_id, "created snapshot");
+        let target_ref = self.snapshot_target(&req.parameters, &req.source_volume_id, &req.name)?;
+        let control_socket = self.cfg.control_socket(&req.source_volume_id);
+        if !control_socket.exists() {
+            return Err(Status::failed_precondition(format!(
+                "volume {} is not mounted on this host; take the snapshot from the node hosting it",
+                req.source_volume_id
+            )));
+        }
+        let staging = self.cfg.capture_staging(&req.source_volume_id);
 
+        let snapshot_id = crate::freeze::freeze_and_push(
+            self.capturer.as_ref(),
+            self.registry.as_ref(),
+            &control_socket,
+            &staging,
+            &target_ref,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("snapshot: {e}")))?;
+
+        info!(snapshot = %snapshot_id, source = %req.source_volume_id, "created snapshot");
         Ok(Response::new(CreateSnapshotResponse {
             snapshot: Some(Snapshot {
                 size_bytes: 0,
@@ -160,7 +197,8 @@ impl Controller for ControllerService {
         if req.snapshot_id.is_empty() {
             return Err(Status::invalid_argument("snapshot_id is required"));
         }
-        // TODO(rspacefs): drop the registry revision if unreferenced.
+        // The snapshot id is a registry revision ref; blob GC in rspace_registry
+        // reclaims it once unreferenced. Nothing controller-side to release.
         info!(snapshot = %req.snapshot_id, "deleted snapshot");
         Ok(Response::new(DeleteSnapshotResponse {}))
     }
@@ -173,8 +211,6 @@ impl Controller for ControllerService {
         if req.volume_id.is_empty() {
             return Err(Status::invalid_argument("volume_id is required"));
         }
-        // rspacefs is single-consumer; we confirm whatever the CO asked for and
-        // let the node enforce access-mode at mount time.
         Ok(Response::new(ValidateVolumeCapabilitiesResponse {
             confirmed: Some(
                 csi_proto::validate_volume_capabilities_response::Confirmed {
@@ -188,7 +224,7 @@ impl Controller for ControllerService {
         }))
     }
 
-    // ---- Unsupported controller RPCs (advertised capabilities exclude these) ----
+    // ---- Unsupported controller RPCs (not advertised) ----
 
     async fn controller_publish_volume(
         &self,
@@ -246,6 +282,28 @@ impl Controller for ControllerService {
         _req: Request<ControllerModifyVolumeRequest>,
     ) -> Result<Response<ControllerModifyVolumeResponse>, Status> {
         Err(Status::unimplemented("MODIFY_VOLUME is not advertised"))
+    }
+}
+
+impl ControllerService {
+    /// Resolve where a snapshot of `source_volume_id` named `name` is pushed:
+    /// the `captureRepo` snapshot-class param, else `<capture_registry>/pvcs/<id>`.
+    fn snapshot_target(
+        &self,
+        params: &HashMap<String, String>,
+        source_volume_id: &str,
+        name: &str,
+    ) -> Result<String, Status> {
+        let repo = if let Some(repo) = params.get(CAPTURE_REPO) {
+            repo.clone()
+        } else if let Some(reg) = &self.cfg.capture_registry {
+            format!("{reg}/pvcs/{source_volume_id}")
+        } else {
+            return Err(Status::failed_precondition(
+                "no captureRepo parameter and no --capture-registry configured",
+            ));
+        };
+        Ok(format!("{repo}:{}", sanitize_tag(name)))
     }
 }
 
